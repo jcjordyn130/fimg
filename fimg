@@ -1,0 +1,433 @@
+#!/bin/env python3
+import argparse
+import subprocess
+import os
+import PIL.Image
+import functools
+import kms
+import numpy as np
+import io
+import pathlib
+import resource
+import atexit
+from fcntl import ioctl
+import time
+from natsort import natsorted
+
+class DRM():
+	def __init__(self, cardpath):
+		print(f"Using GPU at {cardpath}!")
+
+		# Init card and Resource manager
+		self.card = kms.Card(cardpath)
+		self.res = kms.ResourceManager(self.card)
+
+		# Grab TTY to restore framebuffer
+		# The TTY file is opened here as open() does not work during atexit
+		self.tty = get_tty()
+		if self.tty:
+			self.tty = open(self.tty, "rb")
+		else:
+			self.tty = None
+
+		# Register atexit handler to clean up
+		atexit.register(self.__del__)
+
+	def init_fb(self, conn, blank_others = False):
+		# Grab connector
+		self.conn = self.res.reserve_connector(conn)
+
+		# Disable all CRTCs if requested
+		if blank_others:
+			print("Disabling all other displays on user request!")
+			kms.AtomicReq.disable_all(self.card)
+
+		# Grab CRTC
+		self.crtc = self.res.reserve_crtc(self.conn)
+
+		# Grab display mode (resolution) to use
+		# TODO: May be user selectable in the future
+		self.mode = self.conn.get_default_mode()
+
+		# Grab raw pixel format, XRGB8888 (32-bit RGB by default)
+		format = kms.PixelFormats.find_by_name("XRGB8888")
+		
+		# Create dumb framebuffer
+		# This is just an mmap'ed memory buffer linked to the CRTC
+		self.fb = kms.DumbFramebuffer(self.card, self.mode.hdisplay, self.mode.vdisplay, format)
+
+		# Map the framebuffer to a plane
+		self.map = self.fb.map(0)
+
+		# Create numpy buffer for easy writing
+		self.buffer = np.frombuffer(self.map, dtype=np.uint8).reshape(self.fb.height, self.fb.width, 4)
+
+		# Set display mode
+		kms.AtomicReq.set_mode(self.conn, self.crtc, self.fb, self.mode)
+		
+	def blank_fb(self):
+		self.fb.clear()
+
+	def __del__(self):
+		# Clear current framebuffer
+		try:
+			self.fb.clear()
+			pass
+		except ValueError:
+			# Thrown when framebuffer fd is closed
+			pass
+
+		# Needed as the numpy buffer is mmap backed to the DRM device
+		self.buffer = None
+
+		# For some reason, on my system, the TTY mode has to be flipped for this to work
+		restore_tty(self.tty, 0x01) # Graphics mode
+		restore_tty(self.tty, 0x00) # Text mode
+
+def get_tty():
+	# Grab current console
+	tty = None
+
+	# Grab foreground console number from fgconsole
+	try:
+		proc = subprocess.run(["fgconsole"], stdout = subprocess.PIPE, text = True)
+
+		# Validate output
+		# Output should be a single integer representing the console
+		try:
+			tty = f"/dev/tty{int(proc.stdout.strip())}"
+		except ValueError:
+			tty = None
+	except FileNotFoundError:
+		# fgconsole is not installed or this is not Linux
+		tty = None
+
+	if not tty:
+		print(f"Not resetting console on exit due to fgconsole not being installed or the output being invalid!")
+	else:
+		print(f"Using {tty} to restore console on exit!")
+
+	return tty
+
+def restore_tty(tty, mode = 0x00):
+	print(f"Setting tty {tty.name} to mode {mode}")
+
+	# Set the TTY back to text mode
+	try:
+		ioctl(tty, 0x4B3A, mode)
+	except OSError:
+		print("Failed to restore TTY mode due to ioctl error")
+
+class Image():
+	# This is implemented as a class so there is a unified image pipeline
+	def __init__(self, file, target_height, target_width):
+		self.image = self.open(file)
+
+		# Store the target (screen) size for other functions
+		self.target_height = target_height
+		self.target_width = target_width
+		self.target_aspect_ratio = target_width / target_height
+
+	def open(self, file, colorspace = "RGB"):
+		# Grab Image from file
+		image = PIL.Image.open(file)
+
+		# Ensure source image is in the correct color space
+		# non-alpha RGB
+		try:
+			image = image.convert(colorspace)
+		except OSError as e:
+			print(f"WARNING: Input image file is corrupted, original error: {e}")
+			return None
+
+		# Store colorspace for canvas
+		self.colorspace = colorspace
+
+		return image
+
+	def rotate(self, degrees = 0):
+		if degrees != 0:
+			self.image = self.image.rotate(degrees, expand = True, resample = PIL.Image.Resampling.LANCZOS)
+		else:
+			self.image = self.image
+
+	def canvas(self):
+		# Create new canvas
+		canvas = PIL.Image.new(self.colorspace, (self.target_width, self.target_height))
+
+		# Prepare image to fit on canvas
+		# Calculate current aspect ratio
+		current_aspect_ratio = self.image.width / self.image.height
+
+		# Calculate proper crop dimensions
+		if current_aspect_ratio > self.target_aspect_ratio:
+			# Image is wider than target aspect ratio, fit to target width (letterbox)
+			final_width = self.target_width
+			final_height = int(final_width / current_aspect_ratio)
+		else:
+			# Image is taller than the target aspect ratio, or the same as it
+			# fit to target height (pillarbox)
+			final_height = self.target_height
+			final_width = int(final_height * current_aspect_ratio)
+
+		# Resize image to fit aspect ratio
+		self.image = self.image.resize((final_width, final_height), PIL.Image.Resampling.LANCZOS)
+
+		# Calculate position to paste onto
+		paste_x = (self.target_width - self.image.width) // 2
+		paste_y = (self.target_height - self.image.height) // 2
+
+		# Paste onto canvas
+		canvas.paste(self.image, (paste_x, paste_y))
+
+		# Convert to numpy array for KMS
+		return np.array(canvas)
+
+	def zoom(self, zoom_dec):
+		if zoom_dec > 0:
+			# Grab resolution of source image
+			original_width, original_height = self.image.size
+
+			# Calculate and create cropbox
+			left = 0
+			upper = original_height * zoom_dec
+			right = original_width
+			lower = original_height
+			crop_box = (left, upper, right, lower)
+
+			# Test crop box validity
+			if upper >= lower:
+				print("ERROR: crop box is invalid due to upper bound being >= lower bound")
+				return None
+
+			# Crop image
+			print(f"Using crop box of {crop_box}!")
+			self.image = self.image.crop(crop_box)
+		else:
+			# No zoom amount specified.... nothing to do
+			pass
+
+@functools.lru_cache(maxsize = 500)
+def process_image(file, target_height, target_width, zoom = 0, rotate = 0):
+	print(f"Processing file {file} to {target_width}x{target_height} using zoom {zoom}")
+
+	# Create new image
+	image = Image(file, target_height, target_width)
+
+	# Process rotation
+	image.rotate(rotate)
+
+	# Process zoom
+	image.zoom(zoom)
+
+	# Return image placed on centered canvas
+	return image.canvas()
+
+def view_image(drm, imagefile, zoom = False, rotate = 0):
+	print(f"Converting image {imagefile} to required resolution and format!")
+	converted_image = process_image(imagefile, drm.fb.height, drm.fb.width, zoom = zoom, rotate = rotate)
+	if converted_image is None:
+		return
+
+	print("Writing new image data to DRM framebuffer!")
+	# BGR = RGB
+	drm.buffer[:, :, 0] = converted_image[:, :, 2] # B = R
+	drm.buffer[:, :, 1] = converted_image[:, :, 1] # G = G
+	drm.buffer[:, :, 2] = converted_image[:, :, 0] # R = B
+	drm.buffer[:, :, 3] = 255 # X = 255
+
+	print(f"{len(converted_image)} bytes written!")
+
+def get_images(path):
+	valid_images = []
+
+	# Grab valid images
+	for file in path.iterdir():
+		if file.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp"]:
+			valid_images.append(file)
+
+	# Sort the list
+	valid_images = natsorted(valid_images)
+
+	return valid_images
+
+def get_new_directory(cd):
+	while True:
+		print(f"Current directory listing of: {cd}")
+		images = get_images(cd)
+		if len(images) < 1:
+			print("WARNING: new directory has no images!!! application WILL crash")
+
+		print(f"Images in directory: {len(images)}")
+
+		listing = []
+		children = []
+
+		# Add special up directory
+		listing.append("1: ..")
+		children.append("..")
+
+		# Iterate directory and grab children and create a pretty listing
+		for index, child in enumerate(cd.iterdir()):
+			if not child.is_dir():
+				continue
+
+			children.append(child)
+
+			if child == cd:
+				listing.append(f"\033[1m{len(listing) + 1}: {child}\033[0m")
+			else:
+				listing.append(f"{len(listing) + 1}: {child}")
+		print("\n".join(listing))
+
+		# Grab new directory to seek to
+		index = input("Enter new directory to seek to: ")
+
+		# If we didn't get one, assume the user wants to use this one
+		if not index:
+			return cd
+
+		# Check for invalid index
+		# This covers non-integers indexes and non-exisistent indexes
+		try:
+			index = int(index) - 1
+			children[index]
+		except (ValueError, IndexError):
+			print("ERROR: invalid index was entered!")
+			return None
+
+		# Handle going up
+		if children[index] == "..":
+			cd = cd.parent
+			continue
+
+		# Set directory
+		cd = children[index]
+
+# Grab arguments
+parser = argparse.ArgumentParser()
+parser.add_argument("--device", help = "dri device to use (/dev/dri/card[0-9])", required = True)
+parser.add_argument("--plug", help = "dri connector to use (DP-2, HDMI-1, etc)", required = True)
+parser.add_argument("--blank", help = "blank other connectors", required = False, action = "store_true")
+#parser.add_argument("imagefile", help = "image file to start with", nargs="?")
+args = parser.parse_args()
+
+# Setup display
+drm = DRM(args.device)
+drm.init_fb(args.plug, blank_others = args.blank)
+
+# Setup directory listing
+cd = pathlib.Path().resolve()
+images = get_images(cd)
+imageindex = 0
+
+if len(images) < 1:
+	raise RuntimeError("Current directory has no images!")
+
+# Display starting image
+view_image(drm, images[imageindex])
+
+zoom = 0
+rotation = 0
+blank = False
+
+while True:
+	currentfilename = images[imageindex]
+
+	print("####")
+	print(f"Current image: {currentfilename} ({imageindex + 1}/{len(images)})")
+	print(f"Memory Usage: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss} bytes")
+	print("Previous: p | Next: n | Index: i | Zoom: z | Zoom Percentage: zp | Rotate: r")
+	print("Blank: b | Change Directory: cd | View Cache: vc | Clear Cache: cc | Exit: e")
+	op = input("Operation: ").lower()
+
+	if op == "p":
+		if (imageindex - 1) < 0:
+			imageindex = len(images) - 1
+		else:
+			imageindex-=1
+			
+		zoom = 0
+	elif op == "n":
+		if (imageindex + 1) >= len(images):
+			imageindex = 0
+		else:
+			imageindex+=1
+
+		zoom = 0
+	elif op == "z":
+		if zoom == 1/2:
+			zoom = 0
+		elif zoom == 0:
+			zoom = 1/2
+		else:
+			zoom = 0
+	elif op == "zp":
+		zoom_perc = input("Enter zoom in decimal: ")
+		try:
+			zoom = float(zoom_perc)
+		except ValueError:
+			print(f"ERROR: invalid zoom entered: {zoom}!")
+			continue
+	elif op == "r":
+		rotation = input("Enter degrees to rotate by: ")
+		try:
+			rotation = float(rotation)
+		except ValueError:
+			print(f"ERROR: invalid rotation entered!")
+			continue
+	elif op == "b":
+		blank = not blank
+		if blank:
+			drm.blank_fb()
+	elif op == "i":
+		listing = []
+		for i, f in enumerate(dirlisting):
+			if i == currentfile:
+				listing.append(f"\033[1m{i + 1}: {f}\033[0m")
+			else:
+				listing.append(f"{i + 1}: {f}")
+
+		print("\n".join(listing))
+
+		try:
+			# Grab new index
+			index = int(input("Enter index to seek to: "))
+
+			# Check to see if index is in range
+			if index - 1 < 0 or index > len(dirlisting):
+				raise IndexError()
+
+			# Seek to it
+			currentfile = index - 1
+		except ValueError:
+			# Not an index.... or at least not an integer
+			print("ERROR: entered index is not an index")
+			continue
+		except IndexError:
+			# The index isn't in range
+			print("ERROR: entered index is not in range")
+			continue
+	elif op == "e":
+		# Set the TTY back to text mode
+		print("exiting!")
+		#del drm
+		raise SystemExit(0)
+	elif op == "cd":
+		newdirectory = get_new_directory(cd)
+		if not newdirectory:
+			continue
+
+		imageindex = 0
+		cd = newdirectory
+		images = get_images(cd)
+	elif op == "vc":
+		print(f"{process_image.cache_info()}")
+	elif op == "cc":
+		process_image.cache_clear()
+	else:
+		# Don't rewrite image on invalid operations
+		continue
+
+	if not blank:
+		view_image(drm, images[imageindex], zoom = zoom, rotate = rotation)

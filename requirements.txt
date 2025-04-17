@@ -1,0 +1,14 @@
+# Used to sort filenames "naturally" instead of by codepoint
+natsort
+
+# tomba/pykms on GitHub
+# Used for libkms bindings
+https://github.com/tomba/pykms/archive/dfc2d2710c61d2cceb5b1e95d41ff7c55fa80c44.zip
+
+# Used to modify images in-memory to fit onto the framebuffer
+# Size, color space, etc
+pillow
+
+
+# Used for easier access to the backing mmap buffer on the framebuffer
+numpy
