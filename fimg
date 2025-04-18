@@ -13,6 +13,7 @@ import atexit
 from fcntl import ioctl
 import time
 from natsort import natsorted
+import gc
 
 class DRM():
 	def __init__(self, cardpath):
@@ -309,15 +310,22 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--device", help = "dri device to use (/dev/dri/card[0-9])", required = True)
 parser.add_argument("--plug", help = "dri connector to use (DP-2, HDMI-1, etc)", required = True)
 parser.add_argument("--blank", help = "blank other connectors", required = False, action = "store_true")
-#parser.add_argument("imagefile", help = "image file to start with", nargs="?")
+parser.add_argument("directory", help = "directory to start with", nargs="?")
 args = parser.parse_args()
+
+# Tune garbage collection for improved memory usage
+gc.set_threshold(50, 5, 5)
 
 # Setup display
 drm = DRM(args.device)
 drm.init_fb(args.plug, blank_others = args.blank)
 
 # Setup directory listing
-cd = pathlib.Path().resolve()
+if args.directory:
+	cd = pathlib.Path(args.directory).resolve()
+else:
+	cd = pathlib.Path().resolve()
+
 images = get_images(cd)
 imageindex = 0
 
@@ -418,13 +426,26 @@ while True:
 		if not newdirectory:
 			continue
 
+		newimages = get_images(cd)
+		if not newimages:
+			print("ERROR: chosen directory has no images... using previous directory!")
+			continue
+		
+		# Reset file index, current directory, and valid images list
 		imageindex = 0
 		cd = newdirectory
-		images = get_images(cd)
+		images = newimages
+
+		# Clear cache as the cache gets pretty large
+		process_image.cache_clear()
 	elif op == "vc":
 		print(f"{process_image.cache_info()}")
 	elif op == "cc":
+		# Clear lru_cache for images
 		process_image.cache_clear()
+
+		# Force garbage collection
+		gc.collect()
 	else:
 		# Don't rewrite image on invalid operations
 		continue
